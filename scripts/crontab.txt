@@ -1,0 +1,2 @@
+# 每2天 05:00 更新 EPG 节目单（3天窗口）
+0 5 */2 * * /usr/local/bin/python3 /config/epg_update.py >> /data/epg_update.log 2>&1
