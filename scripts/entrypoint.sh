@@ -12,7 +12,7 @@ echo "[$(date)] 启动 HTTP 服务端口 $HTTP_PORT"
 python3 -m http.server $HTTP_PORT --bind :: &
 HTTP_PID=$!
 
-crontab /config/crontab.txt
+crontab /app/crontab.txt
 echo "[$(date)] cron 已加载，启动 crond"
 crond -f -l 2 &
 CROND_PID=$!
