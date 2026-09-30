@@ -7,14 +7,17 @@ if [ -f /config/config.env ]; then
     set +a
 fi
 HTTP_PORT=${HTTP_PORT:-8100}
+EPG_CRON=${EPG_CRON:-"0 5 */2 * *"}
 
 cd /data
 echo "[$(date)] 启动 HTTP 服务端口 $HTTP_PORT"
 python3 -m http.server $HTTP_PORT --bind :: &
 HTTP_PID=$!
 
-crontab /app/crontab.txt
-echo "[$(date)] cron 已加载，启动 crond"
+# 动态生成 crontab，支持通过 EPG_CRON 环境变量自定义更新时间
+echo "$EPG_CRON /usr/local/bin/python3 /app/epg_update.py >> /data/epg_update.log 2>&1" > /tmp/crontab.txt
+crontab /tmp/crontab.txt
+echo "[$(date)] cron 已加载（EPG更新时间: $EPG_CRON），启动 crond"
 crond -f -l 2 &
 CROND_PID=$!
 
