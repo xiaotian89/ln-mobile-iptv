@@ -1,5 +1,6 @@
 #!/bin/sh
 # 辽宁移动IPTV 服务容器入口：HTTP服务 + cron定时更新EPG
+# 兼容两种配置方式：1) /config/config.env 文件 2) 容器环境变量
 if [ -f /config/config.env ]; then
     set -a
     . /config/config.env
