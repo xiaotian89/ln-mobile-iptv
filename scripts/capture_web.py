@@ -22,6 +22,7 @@ MAIN_IFACE = None
 
 # 配置
 CAPTURE_IP = os.environ.get('CAPTURE_IP', '192.168.10.1')
+STB_IP = os.environ.get('STB_IP', '192.168.10.2')
 CAPTURE_NETMASK = os.environ.get('CAPTURE_NETMASK', '255.255.255.0')
 CONFIG_FILE = os.environ.get('CONFIG_FILE', '/config/config.env')
 CONTAINER_NAME = os.environ.get('CONTAINER_NAME', 'iptv-srv')
@@ -40,6 +41,14 @@ def get_main_iface():
     """获取主网口（默认路由出口）"""
     rc, out, _ = run_cmd("ip route show default | awk '{print $5}' | head -1")
     return out if rc == 0 and out else 'eth0'
+
+
+def mask_to_prefix(netmask):
+    """点分十进制掩码转 CIDR 前缀位数：255.255.255.0 -> 24"""
+    try:
+        return sum(bin(int(o)).count('1') for o in netmask.strip().split('.'))
+    except Exception:
+        return 24
 
 
 def list_interfaces():
@@ -70,10 +79,9 @@ def setup_network(iface):
     
     results = []
     
-    # 1. 给网口配 IP
-    cmd = f"ip addr add {CAPTURE_IP}/{CAPTURE_NETMASK.split('.')[-1].count('1')*8 if '.' in CAPTURE_NETMASK else 24} dev {iface} 2>&1 || true"
-    # 简化：直接用 /24
-    cmd = f"ip addr add {CAPTURE_IP}/24 dev {iface} 2>&1; ip link set {iface} up"
+    # 1. 给网口配 IP（掩码可自定义）
+    prefix = mask_to_prefix(CAPTURE_NETMASK)
+    cmd = f"ip addr add {CAPTURE_IP}/{prefix} dev {iface} 2>&1; ip link set {iface} up"
     rc, out, err = run_cmd(cmd)
     results.append(f"配置网口 {iface}: {'成功' if rc == 0 else '失败 - ' + err}")
     
@@ -112,8 +120,11 @@ def cleanup_network():
     if rc == 0 and out.strip():
         iface = out.strip()
     if iface:
-        run_cmd(f"ip addr del {CAPTURE_IP}/24 dev {iface} 2>/dev/null")
-        results.append(f"删除网口 {iface} 的 {CAPTURE_IP}/24")
+        # 用实际配置的完整 CIDR 删除（掩码自定义后也能精确匹配）
+        rc2, cidr, _ = run_cmd(f"ip -o addr show dev {iface} | grep -F '{CAPTURE_IP}' | awk '{{print $4}}' | head -1")
+        cidr = cidr.strip() or f"{CAPTURE_IP}/{mask_to_prefix(CAPTURE_NETMASK)}"
+        run_cmd(f"ip addr del {cidr} dev {iface} 2>/dev/null")
+        results.append(f"删除网口 {iface} 的 {cidr}")
     else:
         results.append(f"未发现 {CAPTURE_IP} 内网IP配置")
     
@@ -219,6 +230,27 @@ def extract_yauth():
     return unique
 
 
+def write_config(pairs):
+    """将多个键值写入/更新 config.env（不存在则追加）"""
+    try:
+        content = ''
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                content = f.read()
+        for key, val in pairs.items():
+            if re.search(rf'^{key}=.*$', content, re.MULTILINE):
+                content = re.sub(rf'^{key}=.*$', f'{key}={val}', content, flags=re.MULTILINE)
+            else:
+                if content and not content.endswith('\n'):
+                    content += '\n'
+                content += f'{key}={val}\n'
+        with open(CONFIG_FILE, 'w') as f:
+            f.write(content)
+        return True, '配置已保存'
+    except Exception as e:
+        return False, f'写入失败: {str(e)}'
+
+
 def apply_token(token):
     """将 token 写入 config.env"""
     try:
@@ -287,6 +319,8 @@ PAGE = '''
   .row { display: flex; gap: 8px; }
   .row button { flex: 1; }
   .hint { font-size: 12px; color: #999; margin-top: 4px; }
+  .ip-input { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; font-family: monospace; min-width: 0; }
+  .ip-input:focus { outline: none; border-color: #1976d2; }
 </style>
 </head>
 <body>
@@ -302,7 +336,15 @@ PAGE = '''
     <button class="btn btn-warning" onclick="cleanupNet()">🧹 清理网络</button>
   </div>
   <div id="netStatus" class="status">未配置</div>
-  <div class="hint">机顶盒设静态IP: 192.168.10.2 / 网关: 192.168.10.1</div>
+  <div class="row" style="margin-top:10px">
+    <input id="stbIp" class="ip-input" placeholder="机顶盒静态IP">
+    <input id="gwIp" class="ip-input" placeholder="网关(抓包网口IP)">
+    <input id="netmaskIp" class="ip-input" placeholder="子网掩码" style="flex:0 0 120px">
+  </div>
+  <div style="text-align:center;margin-top:8px">
+    <button class="btn btn-secondary" onclick="saveConfig()">💾 保存IP设置</button>
+  </div>
+  <div class="hint" id="ipHint">机顶盒设静态IP: -- / 网关: --</div>
 </div>
 
 <div class="card">
@@ -362,9 +404,41 @@ async function loadIfaces() {
 async function setupNet() {
   const iface = document.getElementById('iface').value;
   if (!iface) return alert('请选择网口');
+  // 先保存当前输入的机顶盒IP/网关，再执行网络配置
+  await saveConfig();
   const d = await api('/api/network/setup', {iface});
   document.getElementById('netStatus').innerHTML = d.results.map(r => '<div>'+r+'</div>').join('');
   document.getElementById('netStatus').className = 'status ok';
+}
+
+async function loadConfig() {
+  try {
+    const d = await api('/api/config');
+    document.getElementById('stbIp').value = d.stb_ip;
+    document.getElementById('gwIp').value = d.capture_ip;
+    document.getElementById('netmaskIp').value = d.netmask;
+    updateIpHint(d.stb_ip, d.capture_ip, d.netmask);
+  } catch (e) {
+    document.getElementById('ipHint').textContent = '配置读取失败';
+  }
+}
+
+function updateIpHint(stb, gw, mask) {
+  document.getElementById('ipHint').textContent = '机顶盒设静态IP: ' + stb + ' / 网关: ' + gw + ' / 掩码: ' + mask;
+}
+
+async function saveConfig() {
+  const stb = document.getElementById('stbIp').value.trim();
+  const gw = document.getElementById('gwIp').value.trim();
+  const mask = document.getElementById('netmaskIp').value.trim() || '255.255.255.0';
+  if (!stb || !gw) return alert('请填写机顶盒静态IP和网关');
+  const d = await api('/api/config/save', {stb_ip: stb, capture_ip: gw, netmask: mask});
+  if (d.success) {
+    updateIpHint(stb, gw, mask);
+  } else {
+    alert('保存失败: ' + d.message);
+  }
+  return d;
 }
 
 async function cleanupNet() {
@@ -451,6 +525,7 @@ async function restartOnly() {
 }
 
 loadIfaces();
+loadConfig();
 </script>
 </body>
 </html>
@@ -465,6 +540,40 @@ def index():
 @app.route('/api/interfaces')
 def api_interfaces():
     return jsonify({'interfaces': list_interfaces()})
+
+
+@app.route('/api/config')
+def api_config_get():
+    return jsonify({'stb_ip': STB_IP, 'capture_ip': CAPTURE_IP, 'netmask': CAPTURE_NETMASK})
+
+
+@app.route('/api/config/save', methods=['POST'])
+def api_config_save():
+    global STB_IP, CAPTURE_IP, CAPTURE_NETMASK
+    data = request.get_json(silent=True) or {}
+    stb = (data.get('stb_ip') or '').strip()
+    gw = (data.get('capture_ip') or '').strip()
+    mask = (data.get('netmask') or '').strip() or '255.255.255.0'
+    try:
+        import ipaddress
+        ipaddress.ip_address(stb)
+        ipaddress.ip_address(gw)
+        # 校验掩码：点分十进制且是合法前缀（255.255.255.0 等）
+        octets = mask.split('.')
+        if len(octets) != 4 or any(not o.isdigit() or int(o) not in range(256) for o in octets):
+            raise ValueError('掩码格式无效')
+        bits = sum(bin(int(o)).count('1') for o in octets)
+        if not (0 < bits <= 32):
+            raise ValueError('掩码非法')
+    except Exception:
+        return jsonify({'success': False, 'message': 'IP或掩码格式无效'})
+    # 更新运行时全局
+    STB_IP = stb
+    CAPTURE_IP = gw
+    CAPTURE_NETMASK = mask
+    # 持久化到 config.env（entrypoint 每次启动 source，重启后依然生效）
+    success, msg = write_config({'STB_IP': stb, 'CAPTURE_IP': gw, 'CAPTURE_NETMASK': mask})
+    return jsonify({'success': success, 'message': msg})
 
 
 @app.route('/api/network/setup', methods=['POST'])
