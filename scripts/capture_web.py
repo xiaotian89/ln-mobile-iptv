@@ -43,16 +43,23 @@ def get_main_iface():
 
 
 def list_interfaces():
-    """列出所有网口"""
+    """列出物理网口（过滤 veth/br/docker 等虚拟接口，避免下拉列表被淹没）"""
     rc, out, _ = run_cmd("ip -o link show | awk -F': ' '{print $2}' | grep -v lo")
     ifaces = []
     if rc == 0:
         for line in out.split('\n'):
             name = line.split('@')[0].strip()
-            if name:
-                # 获取 IP 地址
-                rc2, addr, _ = run_cmd(f"ip -o addr show {name} | awk '{{print $4}}' | head -1")
-                ifaces.append({'name': name, 'addr': addr if rc2 == 0 else ''})
+            if not name:
+                continue
+            # 过滤虚拟接口：veth*（容器虚拟网线）、br-*（docker网桥）、ovs-*（OVS内部）、
+            # docker0、virbr*（libvirt）、tap*/vnet*（虚拟化）
+            if (name.startswith('veth') or name.startswith('br-') or name.startswith('ovs')
+                    or name == 'docker0' or name.startswith('virbr')
+                    or name.startswith('tap') or name.startswith('vnet')):
+                continue
+            # 获取 IP 地址
+            rc2, addr, _ = run_cmd(f"ip -o addr show {name} | awk '{{print $4}}' | head -1")
+            ifaces.append({'name': name, 'addr': addr if rc2 == 0 else ''})
     return ifaces
 
 
@@ -70,9 +77,15 @@ def setup_network(iface):
     rc, out, err = run_cmd(cmd)
     results.append(f"配置网口 {iface}: {'成功' if rc == 0 else '失败 - ' + err}")
     
-    # 2. 开启 IP 转发
+    # 2. 开启 IP 转发（容器内 /proc/sys 只读，宿主通常已开启；写失败时回读确认实际状态）
     rc, out, err = run_cmd("echo 1 > /proc/sys/net/ipv4/ip_forward")
-    results.append(f"开启IP转发: {'成功' if rc == 0 else '失败'}")
+    rc2, fwd, _ = run_cmd("cat /proc/sys/net/ipv4/ip_forward")
+    if rc == 0:
+        results.append("开启IP转发: 成功")
+    elif rc2 == 0 and fwd.strip() == '1':
+        results.append("开启IP转发: 已开启(宿主默认)")
+    else:
+        results.append(f"开启IP转发: 失败 - {err}")
     
     # 3. NAT 转发
     run_cmd(f"iptables -t nat -D POSTROUTING -o {MAIN_IFACE} -j MASQUERADE 2>/dev/null")
@@ -85,26 +98,30 @@ def setup_network(iface):
 
 
 def cleanup_network():
-    """清理网络配置"""
+    """清理网络配置（主动检测+幂等，不依赖进程内存状态，容器重启后依然有效）"""
     global CONFIGURED_IFACE
-    if not CONFIGURED_IFACE:
-        return ['未配置网络，无需清理']
-    
     results = []
-    iface = CONFIGURED_IFACE
     main = MAIN_IFACE or get_main_iface()
+    iface = CONFIGURED_IFACE or ''
     
     # 停止抓包
     stop_capture()
     
-    # 清理 iptables
-    run_cmd(f"iptables -t nat -D POSTROUTING -o {main} -j MASQUERADE 2>/dev/null")
-    run_cmd(f"iptables -D FORWARD -i {iface} -j ACCEPT 2>/dev/null")
-    results.append("清理iptables规则")
+    # 1. 主动检测配了抓包内网 IP 的网口（进程重启后也能找到）
+    rc, out, _ = run_cmd(f"ip -o addr show | grep -F '{CAPTURE_IP}' | awk '{{print $2}}' | head -1")
+    if rc == 0 and out.strip():
+        iface = out.strip()
+    if iface:
+        run_cmd(f"ip addr del {CAPTURE_IP}/24 dev {iface} 2>/dev/null")
+        results.append(f"删除网口 {iface} 的 {CAPTURE_IP}/24")
+    else:
+        results.append(f"未发现 {CAPTURE_IP} 内网IP配置")
     
-    # 删除 IP
-    run_cmd(f"ip addr del {CAPTURE_IP}/24 dev {iface} 2>/dev/null")
-    results.append(f"删除网口 {iface} 的IP")
+    # 2. 清理 NAT/转发规则（幂等：不存在时静默忽略）
+    run_cmd(f"iptables -t nat -D POSTROUTING -o {main} -j MASQUERADE 2>/dev/null")
+    if iface:
+        run_cmd(f"iptables -D FORWARD -i {iface} -j ACCEPT 2>/dev/null")
+    results.append("清理NAT/转发规则")
     
     CONFIGURED_IFACE = None
     return results
@@ -220,7 +237,7 @@ def apply_token(token):
         
         with open(CONFIG_FILE, 'w') as f:
             f.write(content)
-        return True, 'Token 已写入配置文件'
+        return True, f'Token 已写入配置文件 ({token[:12]}...)'
     except Exception as e:
         return False, f'写入失败: {str(e)}'
 
@@ -329,9 +346,17 @@ async function api(url, data) {
 }
 
 async function loadIfaces() {
-  const d = await api('/api/interfaces');
   const sel = document.getElementById('iface');
-  sel.innerHTML = d.interfaces.map(i => `<option value="${i.name}">${i.name} ${i.addr ? '('+i.addr+')' : ''}</option>`).join('');
+  try {
+    const d = await api('/api/interfaces');
+    if (!d.interfaces || d.interfaces.length === 0) {
+      sel.innerHTML = '<option value="">未发现物理网口</option>';
+      return;
+    }
+    sel.innerHTML = d.interfaces.map(i => `<option value="${i.name}">${i.name} ${i.addr ? '('+i.addr+')' : '(无IP)'}</option>`).join('');
+  } catch (e) {
+    sel.innerHTML = '<option value="">加载失败，请刷新页面</option>';
+  }
 }
 
 async function setupNet() {
@@ -343,7 +368,7 @@ async function setupNet() {
 }
 
 async function cleanupNet() {
-  const d = await api('/api/network/cleanup');
+  const d = await api('/api/network/cleanup', {});
   document.getElementById('netStatus').innerHTML = d.results.map(r => '<div>'+r+'</div>').join('');
   document.getElementById('netStatus').className = 'status';
 }
@@ -358,7 +383,7 @@ async function startCap() {
 }
 
 async function stopCap() {
-  const d = await api('/api/capture/stop');
+  const d = await api('/api/capture/stop', {});
   document.getElementById('capStatus').textContent = d.message;
   document.getElementById('capStatus').className = 'status';
 }
@@ -369,7 +394,7 @@ async function pollLog() {
   pollTimer = setInterval(async () => {
     const d = await api('/api/capture/log');
     const logEl = document.getElementById('log');
-    logEl.innerHTML = d.log.map(l => l.replace(/(YAUTH:\s*\S+)/gi, '<span class="yauth">$1</span>')).join('\n') || '等待抓包...';
+    logEl.innerHTML = d.log.map(l => l.replace(/(YAUTH:\s*\S+)/gi, '<span class="yauth">$1</span>')).join('<br>') || '等待抓包...';
     logEl.scrollTop = logEl.scrollHeight;
     // 抓包自动停止后：停止轮询并更新状态
     if (!d.running) {
@@ -405,18 +430,22 @@ function selectToken(i) {
 
 async function applyAndRestart() {
   if (!currentToken) return alert('请先提取并选中Token');
+  const el = document.getElementById('applyStatus');
+  el.textContent = '⏳ 正在应用 Token 并重启服务...';
+  el.className = 'status';
   const d = await api('/api/token/apply', {token: currentToken});
-  let msg = d.message;
   if (d.success) {
     const r = await api('/api/service/restart');
-    msg += ' | ' + r.message;
+    el.textContent = '✅ Token 已应用: ' + currentToken.slice(0, 12) + '... | ' + r.message;
+    el.className = 'status ok';
+  } else {
+    el.textContent = '❌ 应用失败: ' + d.message;
+    el.className = 'status err';
   }
-  document.getElementById('applyStatus').textContent = msg;
-  document.getElementById('applyStatus').className = 'status ' + (d.success ? 'ok' : 'err');
 }
 
 async function restartOnly() {
-  const d = await api('/api/service/restart');
+  const d = await api('/api/service/restart', {});
   document.getElementById('applyStatus').textContent = d.message;
   document.getElementById('applyStatus').className = 'status ' + (d.success ? 'ok' : 'err');
 }
