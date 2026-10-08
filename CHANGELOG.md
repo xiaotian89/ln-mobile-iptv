@@ -1,5 +1,15 @@
 # 更新日志
 
+## v1.2.1 (2026-10-08)
+
+### 修复
+- **抓包检测到 YAUTH 后自动停止**：capture_reader 识别到 YAUTH 字段即自动终止 tcpdump，避免日志无限增长和空转（此前需手动点「停止抓包」）
+- **tcpdump 进程组终止**：抓包进程独立进程组启动，停止/自动停止时 killpg 整组终止，杜绝 shell 被杀后 tcpdump 残留为孤儿进程
+- **手动执行 EPG 更新也能取到 YAUTH**：epg_update.py 在环境变量缺失时自动从 /config/config.env 读取配置，`docker exec iptv-srv python3 /app/epg_update.py` 不再报「YAUTH 未设置」
+
+### 改进
+- 抓包日志 API 返回运行状态，前端轮询到自动停止后停止刷新并提示「已自动停止（检测到 YAUTH）」
+
 ## v1.2.0 (2026-10-01)
 
 ### 新增

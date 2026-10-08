@@ -6,6 +6,27 @@ import json, urllib.request, concurrent.futures, datetime, os, sys
 CHANNELS_FILE = os.environ.get("CHANNELS_FILE", "/config/epg_channels.json")
 OUT_FILE = os.environ.get("OUT_FILE", "/data/epg.xml")
 DAYS = int(os.environ.get("EPG_DAYS", "3"))
+
+def load_config_env():
+    """环境变量缺失时从 /config/config.env 补充（docker exec 手动执行也能取到 YAUTH）"""
+    if os.environ.get("YAUTH"):
+        return
+    cfg = os.environ.get("CONFIG_FILE", "/config/config.env")
+    try:
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
+
+load_config_env()
 YAUTH = os.environ.get("YAUTH", "")
 
 ABILITY = ("%257B%2522CITY_CODE%2522%253A%2522416%2522%252C%2522COUNTY_CODE%2522%253A%25221606%2522%252C"
@@ -16,7 +37,7 @@ ABILITY = ("%257B%2522CITY_CODE%2522%253A%2522416%2522%252C%2522COUNTY_CODE%2522
            "%2522userLabelIds%2522%253A%255B%25222113%2522%252C%25222135%2522%252C%25222146%2522%252C%25222134%2522%252C%2522217%2522%252C%25222153%2522%255D%257D")
 HEADERS = {
     "uid": "21200107031163",
-    "YAUTH": YAUTH,
+    "YAUTH": os.environ.get("YAUTH", ""),
     "Host": "iptv-cosv3.lnitv.com:8084",
     "User-Agent": "okhttp/3.12.0",
 }

@@ -5,6 +5,7 @@ IPTV YAUTH 抓包 Web 管理工具
 """
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -110,10 +111,11 @@ def cleanup_network():
 
 
 def capture_reader(proc):
-    """后台线程：读取 tcpdump 输出"""
+    """后台线程：读取 tcpdump 输出，检测到 YAUTH 后自动停止抓包"""
     global CAPTURE_LOG
-    yauth_pattern = re.compile(r'YAUTH:\s*(\S+)', re.IGNORECASE)
-    
+    yauth_pattern = re.compile(r'YAUTH:\s*\S+', re.IGNORECASE)
+    found = False
+
     for line in proc.stdout:
         line = line.strip()
         if not line:
@@ -123,6 +125,13 @@ def capture_reader(proc):
             # 只保留最近 500 行
             if len(CAPTURE_LOG) > 500:
                 CAPTURE_LOG = CAPTURE_LOG[-500:]
+        # 检测到 YAUTH：自动停止抓包，避免 tcpdump 空转和日志无限增长
+        if not found and yauth_pattern.search(line):
+            found = True
+            with CAPTURE_LOCK:
+                CAPTURE_LOG.append('>>> 已检测到 YAUTH，抓包已自动停止（点击「提取Token」扫描）')
+            stop_capture()
+            return
 
 
 def start_capture(iface):
@@ -141,7 +150,8 @@ def start_capture(iface):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        bufsize=1
+        bufsize=1,
+        start_new_session=True  # 独立进程组，停止时可整组终止确保 tcpdump 被杀死
     )
     t = threading.Thread(target=capture_reader, args=(CAPTURE_PROC,), daemon=True)
     t.start()
@@ -149,14 +159,24 @@ def start_capture(iface):
 
 
 def stop_capture():
-    """停止抓包"""
+    """停止抓包（整进程组终止，确保 tcpdump 被真正杀死）"""
     global CAPTURE_PROC
     if CAPTURE_PROC and CAPTURE_PROC.poll() is None:
-        CAPTURE_PROC.terminate()
+        try:
+            os.killpg(CAPTURE_PROC.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
         try:
             CAPTURE_PROC.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            CAPTURE_PROC.kill()
+            try:
+                os.killpg(CAPTURE_PROC.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                CAPTURE_PROC.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         CAPTURE_PROC = None
         return True, '抓包已停止'
     return False, '抓包未在运行'
@@ -351,6 +371,14 @@ async function pollLog() {
     const logEl = document.getElementById('log');
     logEl.innerHTML = d.log.map(l => l.replace(/(YAUTH:\s*\S+)/gi, '<span class="yauth">$1</span>')).join('\n') || '等待抓包...';
     logEl.scrollTop = logEl.scrollHeight;
+    // 抓包自动停止后：停止轮询并更新状态
+    if (!d.running) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+      const auto = d.log.some(l => l.indexOf('已自动停止') !== -1);
+      document.getElementById('capStatus').textContent = auto ? '抓包已自动停止（检测到 YAUTH）' : '抓包未在运行';
+      document.getElementById('capStatus').className = 'status ' + (auto ? 'ok' : '');
+    }
   }, 1000);
 }
 
@@ -446,7 +474,8 @@ def api_capture_stop():
 def api_capture_log():
     with CAPTURE_LOCK:
         log = list(CAPTURE_LOG)
-    return jsonify({'log': log})
+    running = CAPTURE_PROC is not None and CAPTURE_PROC.poll() is None
+    return jsonify({'log': log, 'running': running})
 
 
 @app.route('/api/token/extract')
